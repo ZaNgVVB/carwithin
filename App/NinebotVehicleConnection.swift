@@ -23,9 +23,17 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
     @Published private(set) var devices: [Device] = []
     @Published private(set) var isScanning = false
     @Published private(set) var garage: NinebotVehicleSelection
+    @Published private(set) var debugLogs: [String] = []
+    @Published private(set) var staleKeyVehicleID: UUID?
+    @Published private(set) var staleKeyVehicleName: String?
+
+    var onLog: ((String) -> Void)?
 
     var canBeginPairing: Bool {
         purpose == .pairing && phase == .needsPairing && peripheral?.state == .connected
+    }
+    var canClearStaleKey: Bool {
+        canScan && staleKeyVehicleID != nil
     }
     var canScan: Bool { purpose == nil && pendingProjection == nil && peripheral == nil }
     var canChooseVehicle: Bool { canScan && !scanRequested }
@@ -75,6 +83,8 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
     private var retryTask: DispatchWorkItem?
     private var reconnectTask: DispatchWorkItem?
     private var writeWatchdog: DispatchWorkItem?
+    private var disconnectFallbackTask: DispatchWorkItem?
+    private var loggedDiscovered: Set<UUID> = []
     private var retries = 0
     private var reconnectCount = 0
     private var pairingDeadline: UInt64 = 0
@@ -101,6 +111,34 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
                                    options: [CBCentralManagerOptionShowPowerAlertKey: true])
     }
 
+    private func logBLE(_ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        let line = "\(formatter.string(from: Date())) \(message)"
+        debugLogs.append(line)
+        if debugLogs.count > 80 { debugLogs.removeFirst(debugLogs.count - 80) }
+        onLog?("九号 BLE：\(message)")
+    }
+
+    func clearDebugLogs() {
+        debugLogs.removeAll()
+    }
+
+    func clearStaleKey() {
+        guard canClearStaleKey, let id = staleKeyVehicleID else { return }
+        let name = staleKeyVehicleName ?? id.uuidString
+        do {
+            try keyStore.remove(for: id)
+            staleKeyVehicleID = nil
+            staleKeyVehicleName = nil
+            logBLE("已清除未完成配对的残留密钥：\(name)")
+            transition(.idle, CWL("已清除本机残留密钥，请重新扫描并点选车辆以按 P 键配对。"))
+        } catch {
+            logBLE("清除残留密钥失败：\(error.localizedDescription)")
+            transition(.failed, CWL("删除配对记录失败（{1}）。", [error.localizedDescription]))
+        }
+    }
+
     func startScan() {
         guard canScan else { return }
         scanRequested = true
@@ -113,6 +151,8 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
         scanDetails.removeAll()
         devices.removeAll()
         peripherals.removeAll()
+        loggedDiscovered.removeAll()
+        logBLE("开始扫描九号车辆（centralState=\(central.state.rawValue)）")
         // Some supported vehicles omit the UART service from their advertisement.
         central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         isScanning = true
@@ -271,11 +311,13 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
         peripherals[item.identifier] = item
         item.delegate = self
         nameBytes = Data(selection.name.utf8.suffix(16))
+        logBLE("发起连接 \(selection.name) · purpose=\(purpose == .pairing ? "pairing" : "projection") · v\(selection.protocolVersion) · advSNLen=\(selection.serialLength.map(String.init) ?? "nil") · state=\(item.state.rawValue)")
         transition(.connecting, CWL("正在连接 {1}…", [selection.name]))
         if item.state == .disconnecting {
             disconnecting = true
             reconnectAfterDisconnect = true
             transition(.reconnecting, CWL("等待上一条蓝牙连接完全断开后再恢复会话。"))
+            scheduleDisconnectFallback()
         } else {
             // A system-connected peripheral may belong only to another app.
             // Claim it through this central before using its GATT services.
@@ -287,6 +329,7 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
     private func discover(_ item: CBPeripheral) {
         guard isCurrent(item), !disconnecting, wantsSession else { return }
         deadlineTask?.cancel()
+        logBLE("蓝牙已连接，开始发现服务 6E400001")
         transition(.discovering, CWL("正在查找指令服务和通知通道…"))
         item.discoverServices([Self.service])
         armDeadline(seconds: 12) { $0.fail(CWL("蓝牙服务发现或通知启用超时。"), retryable: true) }
@@ -302,7 +345,14 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
             try crypto.setKey(nameBytes, nil)
             // Read before proceeding: a locked/unavailable Keychain must not look
             // like an unpaired vehicle and trigger accidental key replacement.
-            candidateKeys = authenticationAttempts.remaining(from: try keyStore.load(for: selection.id).authenticationCandidates)
+            let record = try keyStore.load(for: selection.id)
+            if record.confirmedKey == nil, record.pendingKey != nil,
+               !garage.vehicles.contains(where: { $0.id == selection.id }) {
+                staleKeyVehicleID = selection.id
+                staleKeyVehicleName = selection.name
+            }
+            candidateKeys = authenticationAttempts.remaining(from: record.authenticationCandidates)
+            logBLE("开始 0x5B PRE_COMM：nameLen=\(nameBytes.count) · confirmed=\(record.confirmedKey?.count ?? 0)B · pending=\(record.pendingKey?.count ?? 0)B(ack=\(record.pendingWriteAcknowledged)) · candidates=\(candidateKeys.count)")
             retries = 0
             transition(.preparing, CWL("正在读取车辆认证参数…"))
             try send(command: 0x5b, destination: 0x04)
@@ -317,6 +367,7 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
             retries = 0
             currentKey = key
             try crypto.setKey(key, authParameter)
+            logBLE("开始 0x5D AUTH：keyLen=\(key.count)B · snLen=\(serialNumber.count)B")
             transition(.authenticating, CWL("正在用本机保存的密钥认证…"))
             try send(command: 0x5d, destination: 0x04, payload: serialNumber)
             scheduleHandshakeRetry(for: .authenticating)
@@ -333,6 +384,7 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
     }
 
     private func handle(_ frame: VehicleBLEFrame) {
+        logBLE("RX src=0x\(String(format: "%02X", Int(frame.src))) dst=0x\(String(format: "%02X", Int(frame.dst))) cmd=0x\(String(format: "%02X", Int(frame.command))) idx=0x\(String(format: "%02X", Int(frame.index))) len=\(frame.payload.count) phase=\(phase.rawValue)")
         guard frame.dst == 0x3e, !disconnecting else { return }
         if frame.src == 0x23, frame.command == 0x71 {
             if frame.index == 0xff, frame.payload == Data([0]), authenticated, purpose == .projection {
@@ -358,7 +410,17 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
         do {
             switch (phase, frame.command) {
             case (.preparing, 0x5b):
-                let serialLength = attemptVehicle?.serialLength ?? 14
+                let remaining = frame.payload.count - 16
+                let advLen = attemptVehicle?.serialLength
+                let serialLength: Int
+                if let advLen, advLen > 0, advLen <= 64, remaining >= advLen {
+                    serialLength = advLen
+                } else if remaining > 0, remaining <= 64 {
+                    serialLength = remaining
+                } else {
+                    serialLength = 14
+                }
+                logBLE("0x5B 回包：idx=\(frame.index) · payloadLen=\(frame.payload.count) · rem=\(remaining) · advSNLen=\(advLen.map(String.init) ?? "nil") · usedSNLen=\(serialLength)")
                 guard serialLength > 0, serialLength <= 64,
                       frame.payload.count >= 16 + serialLength else {
                     fail(CWL("车辆返回的认证信息长度无效。"), retryable: false)
@@ -382,6 +444,7 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
             case (.pairing, 0x5c):
                 if frame.index == 1, let key = currentKey, let selection = attemptVehicle {
                     retryTask?.cancel()
+                    logBLE("0x5C 已收到车端确认(idx=1)，切入 0x5D 认证")
                     try keyStore.acknowledgeWrite(key, for: selection.id)
                     candidateKeys.removeAll()
                     beginAuthentication(with: key)
@@ -391,9 +454,12 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
                 retryTask?.cancel()
                 if frame.index == 1, let key = currentKey, let selection = attemptVehicle {
                     try keyStore.confirmAuthentication(key, for: selection.id)
+                    staleKeyVehicleID = nil
+                    staleKeyVehicleName = nil
                     authenticated = true
                     authenticationAttempts = VehicleAuthenticationAttempts()
                     candidateKeys.removeAll()
+                    logBLE("0x5D 认证成功！purpose=\(purpose == .pairing ? "pairing" : "projection")")
                     if purpose == .pairing {
                         updateGarage { $0.save(selection) }
                         finishDisconnect(message: CWL("配对完成。请在「已配对车辆」中选择这台车。"))
@@ -401,6 +467,7 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
                         requestNavigation()
                     }
                 } else {
+                    logBLE("0x5D 被车端拒绝：idx=\(frame.index)")
                     authenticationFailed(CWL("车辆未接受保存的密钥。"))
                 }
             default: break
@@ -420,6 +487,7 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
         }
         let plain = try frame.encode()
         let wire = try crypto.encrypt(plain)
+        logBLE("TX dst=0x\(String(format: "%02X", Int(destination))) cmd=0x\(String(format: "%02X", Int(command))) idx=0x\(String(format: "%02X", Int(index))) payloadLen=\(payload.count) wireLen=\(wire.count) canWriteNR=\(peripheral.canSendWriteWithoutResponse)")
         guard outgoing.count < 16, queuedBytes + wire.count <= 4096 else {
             throw SessionError.message(CWL("蓝牙发送队列拥塞。"))
         }
@@ -574,9 +642,11 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
         deadlineTask?.cancel()
         retryTask?.cancel()
         writeWatchdog?.cancel()
+        disconnectFallbackTask?.cancel()
         deadlineTask = nil
         retryTask = nil
         writeWatchdog = nil
+        disconnectFallbackTask = nil
         outgoing.removeAll()
         queuedBytes = 0
         assembler.reset()
@@ -596,16 +666,40 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
         disconnecting = false
     }
 
+    private func scheduleDisconnectFallback() {
+        disconnectFallbackTask?.cancel()
+        let captured = epoch
+        let task = DispatchWorkItem { [weak self] in
+            guard let self, self.epoch == captured, self.disconnecting else { return }
+            self.logBLE("断开连接回调超时，强制复位 BLE 状态（reconnect=\(self.reconnectAfterDisconnect)）")
+            let retry = self.wantsSession && self.reconnectAfterDisconnect
+            self.disconnecting = false
+            self.reconnectAfterDisconnect = false
+            self.peripheral = nil
+            if retry { self.scheduleReconnect() }
+            else if self.purpose != nil { self.finishAttempt() }
+            else { self.startPendingProjection() }
+        }
+        disconnectFallbackTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: task)
+    }
+
     private func authenticationFailed(_ reason: String) {
+        logBLE("认证失败：\(reason) · remainingCandidates=\(authenticationAttempts.remaining(from: candidateKeys).count)")
         if let currentKey { authenticationAttempts.reject(currentKey) }
         if !authenticationAttempts.remaining(from: candidateKeys).isEmpty {
             fail(CWL("{1} 将重新握手尝试另一份已保存密钥。", [reason]), retryable: true)
         } else {
-            fail(CWL("{1} 已停止自动重试。可在「车辆配对」重新扫描，或删除旧记录后重新配对。", [reason]), retryable: false)
+            if let selection = attemptVehicle, !garage.vehicles.contains(where: { $0.id == selection.id }) {
+                staleKeyVehicleID = selection.id
+                staleKeyVehicleName = selection.name
+            }
+            fail(CWL("{1} 已停止自动重试。可在「车辆配对」清除残留密钥后重新扫描配对。", [reason]), retryable: false)
         }
     }
 
     private func fail(_ message: String, retryable: Bool) {
+        logBLE("状态失败(phase=\(phase.rawValue), retryable=\(retryable), reconnectCount=\(reconnectCount))：\(message)")
         reconnectTask?.cancel()
         reconnectTask = nil
         let shouldReconnect = retryable && wantsSession && reconnectCount < 5
@@ -616,6 +710,7 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
         if let peripheral, peripheral.state != .disconnected {
             disconnecting = true
             central.cancelPeripheralConnection(peripheral)
+            scheduleDisconnectFallback()
             // Never start another attempt on the same CBPeripheral until its old
             // connection has actually ended: delegates do not carry our epoch.
         } else {
@@ -626,6 +721,7 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
     }
 
     private func finishDisconnect(message: String) {
+        logBLE("结束连接：\(message)")
         finishAttempt()
         resetAttempt()
         reconnectAfterDisconnect = false
@@ -633,6 +729,7 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
         if let peripheral, peripheral.state != .disconnected {
             disconnecting = true
             central.cancelPeripheralConnection(peripheral)
+            scheduleDisconnectFallback()
         } else {
             peripheral = nil
             startPendingProjection()
@@ -749,6 +846,10 @@ extension NinebotVehicleConnection: @preconcurrency CBCentralManagerDelegate {
         else if !evidence.hasConnectableAdvertisement { detail = CWL("已识别，等待可连接的广播。") }
         else { detail = CWL("已识别，可连接（广播 v{1}）。", [String(advertisement.protocolVersion)]) }
         let displayName = evidence.localName.isEmpty ? (item.name ?? CWL("未命名设备")) : evidence.localName
+        if evidence.isEligible, loggedDiscovered.insert(item.identifier).inserted {
+            let tlvSummary = advertisement.rawTLVs.map { "t\($0.type)=\($0.value.count)B" }.joined(separator: ",")
+            logBLE("发现车辆：\(displayName) · mfg=0x\(String(format: "%04X", Int(advertisement.manufacturerID))) · v\(advertisement.protocolVersion) · advSNLen=\(advertisement.serialNumberLength.map(String.init) ?? "nil") · tlvs=[\(tlvSummary)]")
+        }
         upsert(Device(id: item.identifier, name: displayName,
                       isConnectable: evidence.isEligible, detail: detail))
     }
@@ -763,6 +864,7 @@ extension NinebotVehicleConnection: @preconcurrency CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didFailToConnect item: CBPeripheral, error: Error?) {
         guard isCurrent(item) else { return }
+        logBLE("BLE 建链失败：\(error?.localizedDescription ?? "未知错误")")
         resetAttempt()
         peripheral = nil
         if wantsSession { scheduleReconnect() }
@@ -772,6 +874,7 @@ extension NinebotVehicleConnection: @preconcurrency CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral item: CBPeripheral, error: Error?) {
         guard isCurrent(item) else { return }
+        logBLE("BLE 断开：phase=\(phase.rawValue) · disconnecting=\(disconnecting) · err=\(error?.localizedDescription ?? "无")")
         if !disconnecting && phase == .authenticating {
             authenticationFailed(CWL("认证期间连接中断。"))
             return
@@ -794,9 +897,12 @@ extension NinebotVehicleConnection: @preconcurrency CBPeripheralDelegate {
     func peripheral(_ item: CBPeripheral, didDiscoverServices error: Error?) {
         guard isCurrent(item), !disconnecting, phase == .discovering else { return }
         guard error == nil, let service = item.services?.first(where: { $0.uuid == Self.service }) else {
+            let uuids = item.services?.map(\.uuid.uuidString).joined(separator: ",") ?? "none"
+            logBLE("服务发现失败：err=\(error?.localizedDescription ?? "无") · services=[\(uuids)]")
             fail(CWL("未发现九号指令服务。"), retryable: false)
             return
         }
+        logBLE("已发现 6E400001 服务，查找读写特征")
         item.discoverCharacteristics([Self.writeID, Self.notifyID], for: service)
     }
 
@@ -807,11 +913,14 @@ extension NinebotVehicleConnection: @preconcurrency CBPeripheralDelegate {
               write.properties.contains(.writeWithoutResponse),
               let notify = service.characteristics?.first(where: { $0.uuid == Self.notifyID }),
               notify.properties.contains(.notify) || notify.properties.contains(.indicate) else {
+            logBLE("特征发现失败：err=\(error?.localizedDescription ?? "无")")
             fail(CWL("指令服务缺少写入或通知能力。"), retryable: false)
             return
         }
         writeCharacteristic = write
         notifyCharacteristic = notify
+        let maxLen = item.maximumWriteValueLength(for: .withoutResponse)
+        logBLE("特征就绪：maxWriteNR=\(maxLen) · isNotifying=\(notify.isNotifying)")
         if notify.isNotifying { beginPrecommunication() }
         else { item.setNotifyValue(true, for: notify) }
     }
@@ -819,15 +928,18 @@ extension NinebotVehicleConnection: @preconcurrency CBPeripheralDelegate {
     func peripheral(_ item: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         guard isCurrent(item), !disconnecting, characteristic === notifyCharacteristic else { return }
         guard error == nil, characteristic.isNotifying else {
+            logBLE("开启通知失败：err=\(error?.localizedDescription ?? "无") · isNotifying=\(characteristic.isNotifying)")
             fail(CWL("蓝牙通知已关闭或启用失败。"), retryable: true)
             return
         }
+        logBLE("BLE 通知已启用")
         if phase == .discovering { beginPrecommunication() }
     }
 
     func peripheral(_ item: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard isCurrent(item), !disconnecting, characteristic === notifyCharacteristic else { return }
         guard error == nil, let data = characteristic.value else {
+            logBLE("读取通知值失败：err=\(error?.localizedDescription ?? "无")")
             fail(CWL("读取蓝牙通知失败。"), retryable: true)
             return
         }
@@ -841,6 +953,12 @@ extension NinebotVehicleConnection: @preconcurrency CBPeripheralDelegate {
                 handle(frame)
             } catch {
                 invalidPacketCount += 1
+                if invalidPacketCount == 1 || invalidPacketCount == 8 {
+                    let wireSerial: UInt16 = wire.count >= 2
+                        ? (UInt16(wire[wire.count - 2]) << 8 | UInt16(wire[wire.count - 1]))
+                        : 0
+                    logBLE("RX 解密/解析失败(#\(invalidPacketCount))：phase=\(phase.rawValue) · wireLen=\(wire.count) · wireSerial=\(wireSerial) · err=\(error.localizedDescription)")
+                }
                 if invalidPacketCount >= 8 {
                     if phase == .authenticating { authenticationFailed(CWL("保存的密钥无法验证车辆回复。")) }
                     else { fail(CWL("连续收到无法验证的蓝牙数据，将重新认证。"), retryable: wantsSession) }

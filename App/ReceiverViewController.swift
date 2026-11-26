@@ -699,6 +699,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             }
         }
         antBMS.onLog = { [weak self] in self?.log($0) }
+        ninebotVehicle.onLog = { [weak self] in self?.log($0) }
         antBMS.onImage = { [weak self] image, configuration in
             self?.receiver.setBMSOverlay(image, configuration: configuration)
         }
