@@ -1,0 +1,88 @@
+name: Build Unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: "Run Swift core unit tests before building"
+        type: boolean
+        default: true
+      bundle_id:
+        description: "Optional Bundle Identifier override (leave empty for default local.tds.carkit)"
+        type: string
+        default: ""
+  push:
+    branches:
+      - main
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show build toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          python3 --version
+
+      - name: Run TDSCarKitCore unit tests
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
+        run: bash Tools/test.sh
+
+      - name: Regenerate Xcode project
+        env:
+          TDS_BUNDLE_IDENTIFIER: ${{ inputs.bundle_id }}
+        run: |
+          if [ -z "$TDS_BUNDLE_IDENTIFIER" ]; then
+            unset TDS_BUNDLE_IDENTIFIER
+          fi
+          python3 Tools/generate_project.py
+
+      - name: Build unsigned Release arm64 app
+        run: |
+          xcodebuild \
+            -project TDSCarKit.xcodeproj \
+            -scheme TDSCarKit \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            -derivedDataPath build/source \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          APP_PATH="build/source/Build/Products/Release-iphoneos/TDSCarKit.app"
+          test -d "$APP_PATH"
+
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PATH/Info.plist")
+          BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_PATH/Info.plist")
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IPA_NAME="CarWithin-${VERSION}-b${BUILD}-${SHORT_SHA}-unsigned.ipa"
+
+          rm -rf build/ipa
+          mkdir -p build/ipa/Payload
+          cp -R "$APP_PATH" build/ipa/Payload/
+          rm -rf build/ipa/Payload/TDSCarKit.app/_CodeSignature
+
+          (cd build/ipa && zip -qry "../${IPA_NAME}" Payload)
+
+          echo "IPA_PATH=build/${IPA_NAME}" >> "$GITHUB_ENV"
+          echo "IPA_NAME=${IPA_NAME}" >> "$GITHUB_ENV"
+
+          ls -lh "build/${IPA_NAME}"
+          shasum -a 256 "build/${IPA_NAME}"
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_NAME }}
+          path: ${{ env.IPA_PATH }}
+          retention-days: 14
+          if-no-files-found: error
