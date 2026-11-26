@@ -11,9 +11,15 @@ struct NinebotVehiclePairingView: View {
     var body: some View {
         Form {
             Section {
-                Text(connection.status)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                if connection.readyForButtonPress {
+                    Label(connection.status, systemImage: "checkmark.circle.fill")
+                        .font(.headline)
+                        .foregroundStyle(.green)
+                } else {
+                    Text(connection.status)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section {
@@ -81,7 +87,7 @@ struct NinebotVehiclePairingView: View {
                 } header: {
                     Text(CWL("添加车辆"))
                 } footer: {
-                    Text(CWL("通电后扫描并选择自己的车辆。建立本机配对时，按车上的 P 键确认。"))
+                    Text(CWL("通电后扫描并选择自己的车辆。发起配对后请等待约 5–8 秒，待提示「车机已就绪」并震动后再短按车上的 P 键。"))
                 }
             }
 

@@ -1,6 +1,9 @@
 import Foundation
 import Combine
 import CoreBluetooth
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Manages owner-confirmed Ninebot pairing and the projection navigation session.
 @MainActor
@@ -23,6 +26,7 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
     @Published private(set) var devices: [Device] = []
     @Published private(set) var isScanning = false
     @Published private(set) var garage: NinebotVehicleSelection
+    @Published private(set) var readyForButtonPress = false
     @Published private(set) var debugLogs: [String] = []
     @Published private(set) var staleKeyVehicleID: UUID?
     @Published private(set) var staleKeyVehicleName: String?
@@ -92,6 +96,7 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
     private var disconnectFallbackTask: DispatchWorkItem?
     private var loggedDiscovered: Set<UUID> = []
     private var retries = 0
+    private var pairingAckWaitRetries = 0
     private var reconnectCount = 0
     private var pairingDeadline: UInt64 = 0
     private var disconnecting = false
@@ -240,8 +245,10 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
             currentKey = key
             wantsSession = true
             try crypto.setKey(nameBytes, authParameter)
+            readyForButtonPress = false
+            pairingAckWaitRetries = 0
             pairingDeadline = DispatchTime.now().uptimeNanoseconds + 60_000_000_000
-            transition(.pairing, CWL("配对请求已发出，请在 60 秒内按 P 键确认。收到确认后会自动继续认证。"))
+            transition(.pairing, CWL("正在等待车机进入配对状态（约 5–8 秒），请先不要按 P 键…"))
             try send(command: 0x5c, destination: 0x04, payload: key)
             schedulePairingRetry()
         } catch {
@@ -497,12 +504,22 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
             case (.pairing, 0x5c):
                 if frame.index == 1, let key = currentKey, let selection = attemptVehicle {
                     retryTask?.cancel()
+                    readyForButtonPress = false
                     logBLE("0x5C 已收到车端确认(idx=1)，切入 0x5D 认证")
                     try keyStore.acknowledgeWrite(key, for: selection.id)
                     candidateKeys.removeAll()
                     beginAuthentication(with: key)
+                } else if frame.index == 0, !readyForButtonPress {
+                    readyForButtonPress = true
+                    pairingAckWaitRetries = 0
+                    pairingDeadline = DispatchTime.now().uptimeNanoseconds + 60_000_000_000
+                    logBLE("车机已进入配对确认状态(0x5C idx=0)，现在请按 P 键")
+                    #if canImport(UIKit)
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    #endif
+                    transition(.pairing, CWL("车机已就绪！请现在短按一下车上的 P 键确认配对。"))
                 }
-                // Other indices mean continue waiting for physical confirmation.
+                // Repeated idx=0 replies mean the vehicle is still waiting for P button press.
             case (.authenticating, 0x5d):
                 retryTask?.cancel()
                 if frame.index == 1, let key = currentKey, let selection = attemptVehicle {
@@ -666,10 +683,20 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
         let task = DispatchWorkItem { [weak self] in
             guard let self, self.epoch == captured, self.phase == .pairing, self.wantsSession else { return }
             if DispatchTime.now().uptimeNanoseconds >= self.pairingDeadline {
+                self.readyForButtonPress = false
                 self.currentKey = nil
                 self.wantsSession = false
-                self.transition(.needsPairing, CWL("等待 P 键确认超时。请重新点击「建立本机配对」，并在 60 秒内按一下车上的 P 键。配对记录已保留。"))
+                self.transition(.needsPairing, CWL("等待 P 键确认超时。请重新点击「建立本机配对」，等提示「车机已就绪」后再按车上的 P 键。"))
                 return
+            }
+            if !self.readyForButtonPress {
+                self.pairingAckWaitRetries += 1
+                if self.pairingAckWaitRetries >= 8 {
+                    self.logBLE("连续 8 次 0x5C 未收到车机就绪回包(idx=0)，自动重连重试配对")
+                    self.autoPairOnPrecomm = true
+                    self.fail(CWL("车机未响应配对请求，正在自动重连重试（请先不要按 P 键）…"), retryable: true)
+                    return
+                }
             }
             do {
                 if self.outgoing.isEmpty, let key = self.currentKey {
@@ -715,6 +742,8 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
         writeCharacteristic = nil
         notifyCharacteristic = nil
         invalidPacketCount = 0
+        readyForButtonPress = false
+        pairingAckWaitRetries = 0
         dashboardExitHandled = false
         endingAfterExitReply = false
         endingAfterStopWrite = false
@@ -810,7 +839,10 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
         reconnectTask?.cancel()
         reconnectCount += 1
         let delay = min(20.0, pow(2.0, Double(reconnectCount)))
-        transition(.reconnecting, CWL("连接中断，{1} 秒后重连（{2}/5）；不会自动重新配对。", [String(Int(delay)), String(reconnectCount)]))
+        let message = autoPairOnPrecomm
+            ? CWL("正在重置配对会话，{1} 秒后重连（{2}/5），请先不要按 P 键…", [String(Int(delay)), String(reconnectCount)])
+            : CWL("连接中断，{1} 秒后重连（{2}/5）；不会自动重新配对。", [String(Int(delay)), String(reconnectCount)])
+        transition(.reconnecting, message)
         let captured = epoch
         let task = DispatchWorkItem { [weak self] in
             guard let self, self.epoch == captured, self.wantsSession else { return }
@@ -1028,6 +1060,12 @@ extension NinebotVehicleConnection: @preconcurrency CBPeripheralDelegate {
                         ? (UInt16(wire[wire.count - 2]) << 8 | UInt16(wire[wire.count - 1]))
                         : 0
                     logBLE("RX 解密/解析失败(#\(invalidPacketCount))：phase=\(phase.rawValue) · wireLen=\(wire.count) · wireSerial=\(wireSerial) · err=\(error.localizedDescription)")
+                    if phase == .pairing && !readyForButtonPress && wire.count == 13 && wireSerial == 2 {
+                        logBLE("检测到车机就绪前收到旧会话包（可能提前按了 P 键），自动重连重新发起配对")
+                        autoPairOnPrecomm = true
+                        fail(CWL("检测到提前按了 P 键，正在自动重连重试；请等提示「车机已就绪」后再按 P 键…"), retryable: true)
+                        return
+                    }
                 }
                 if invalidPacketCount >= 8 {
                     if phase == .authenticating { authenticationFailed(CWL("保存的密钥无法验证车辆回复。")) }

@@ -593,12 +593,16 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         }, for: .touchUpInside)
         ninebotCard.addArrangedSubview(ninebotQuickRePairButton)
         ninebotVehicleObservation = ninebotVehicle.$status
-            .combineLatest(ninebotVehicle.$garage, ninebotVehicle.$phase, ninebotVehicle.$isScanning)
-            .sink { [weak self] status, garage, _, _ in
+            .combineLatest(ninebotVehicle.$garage, ninebotVehicle.$phase, ninebotVehicle.$readyForButtonPress)
+            .sink { [weak self] status, garage, _, readyForButton in
                 guard let self else { return }
                 self.ninebotVehicleButton.configuration?.subtitle = garage.selected?.name
                 self.ninebotVehicleStatus.isHidden = garage.selected == nil && !self.ninebotVehicle.isPairing
                 self.ninebotVehicleStatus.text = status
+                self.ninebotVehicleStatus.textColor = readyForButton ? .systemGreen : .secondaryLabel
+                self.ninebotVehicleStatus.font = readyForButton
+                    ? .preferredFont(forTextStyle: .headline)
+                    : .preferredFont(forTextStyle: .footnote)
                 self.refreshNinebotQuickRePairButton()
             }
         stack.addArrangedSubview(ninebotCard)
