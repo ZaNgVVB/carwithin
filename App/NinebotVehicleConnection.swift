@@ -32,12 +32,15 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
     var canBeginPairing: Bool {
         purpose == .pairing && phase == .needsPairing && peripheral?.state == .connected
     }
+    var canQuickRePair: Bool {
+        canScan && garage.selected != nil
+    }
     var canClearStaleKey: Bool {
         canScan && staleKeyVehicleID != nil
     }
-    var canScan: Bool { purpose == nil && pendingProjection == nil && peripheral == nil }
+    var canScan: Bool { purpose == nil && pendingProjection == nil && pendingRePair == nil && peripheral == nil }
     var canChooseVehicle: Bool { canScan && !scanRequested }
-    var isPairing: Bool { purpose == .pairing || scanRequested }
+    var isPairing: Bool { purpose == .pairing || scanRequested || pendingRePair != nil }
 
     private enum Purpose { case pairing, projection }
 
@@ -57,6 +60,9 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
     private var purpose: Purpose?
     private var attemptVehicle: NinebotVehicle?
     private var pendingProjection: NinebotVehicle?
+    private var pendingRePair: NinebotVehicle?
+    private var autoPairOnPrecomm = false
+    private var rePairScanTargetID: UUID?
     private var wantsSession = false
     private var scanRequested = false
     private var peripherals: [UUID: CBPeripheral] = [:]
@@ -189,12 +195,46 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
         authenticationAttempts = VehicleAuthenticationAttempts()
     }
 
+    /// Explicit UI action only. Reconnects to the currently selected vehicle and
+    /// immediately triggers SET_PWD so the user only needs to press the P button.
+    func rePairSelectedVehicle() {
+        guard canScan, let vehicle = garage.selected else { return }
+        logBLE("发起一键重新配对：\(vehicle.name)")
+        pendingRePair = vehicle
+        prepareCentral()
+        if central.state == .poweredOn { startPendingRePair() }
+        else { reportBluetoothState() }
+    }
+
+    private func startPendingRePair() {
+        guard peripheral == nil, let vehicle = pendingRePair else { return }
+        pendingRePair = nil
+        autoPairOnPrecomm = true
+        begin(.pairing, vehicle: vehicle)
+        if let item = peripherals[vehicle.id] ?? central.retrievePeripherals(withIdentifiers: [vehicle.id]).first {
+            connectPeripheral(item)
+        } else {
+            rePairScanTargetID = vehicle.id
+            logBLE("系统缓存中无已保存外设，启动定向扫描：\(vehicle.name)")
+            central.stopScan()
+            central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+            isScanning = true
+            transition(.scanning, CWL("正在查找已保存车辆 {1}…", [vehicle.name]))
+            armDeadline(seconds: 15) { connection in
+                connection.rePairScanTargetID = nil
+                if connection.central?.isScanning == true { connection.central.stopScan() }
+                connection.isScanning = false
+                connection.fail(CWL("未扫描到已保存车辆，请确认车辆已通电且未被其他 App 占用蓝牙。"), retryable: false)
+            }
+        }
+    }
+
     /// Explicit UI action only. Neither state restoration nor authentication failure
     /// is permitted to call SET_PWD or generate a replacement key automatically.
-    func beginPairing() {
+    func beginPairing(forceNew: Bool = false) {
         guard canBeginPairing, let selection = attemptVehicle, let authParameter else { return }
         do {
-            let key = try keyStore.prepareCandidate(for: selection.id)
+            let key = try keyStore.prepareCandidate(for: selection.id, forceNew: forceNew)
             authenticationAttempts = VehicleAuthenticationAttempts()
             candidateKeys.removeAll()
             currentKey = key
@@ -234,6 +274,9 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
     }
 
     func cancelPairing() {
+        pendingRePair = nil
+        autoPairOnPrecomm = false
+        rePairScanTargetID = nil
         stopScan()
         guard purpose == .pairing else { return }
         reconnectTask?.cancel()
@@ -351,8 +394,8 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
                 staleKeyVehicleID = selection.id
                 staleKeyVehicleName = selection.name
             }
-            candidateKeys = authenticationAttempts.remaining(from: record.authenticationCandidates)
-            logBLE("开始 0x5B PRE_COMM：nameLen=\(nameBytes.count) · confirmed=\(record.confirmedKey?.count ?? 0)B · pending=\(record.pendingKey?.count ?? 0)B(ack=\(record.pendingWriteAcknowledged)) · candidates=\(candidateKeys.count)")
+            candidateKeys = autoPairOnPrecomm ? [] : authenticationAttempts.remaining(from: record.authenticationCandidates)
+            logBLE("开始 0x5B PRE_COMM：nameLen=\(nameBytes.count) · confirmed=\(record.confirmedKey?.count ?? 0)B · pending=\(record.pendingKey?.count ?? 0)B(ack=\(record.pendingWriteAcknowledged)) · candidates=\(candidateKeys.count) · autoPair=\(autoPairOnPrecomm)")
             retries = 0
             transition(.preparing, CWL("正在读取车辆认证参数…"))
             try send(command: 0x5b, destination: 0x04)
@@ -442,8 +485,14 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
                         fail(CWL("此车需要重新配对。请停止投屏，再打开「车辆配对」。"), retryable: false)
                         return
                     }
-                    wantsSession = false
-                    transition(.needsPairing, CWL("点击「建立本机配对」，然后按一下车上的 P 键确认。"))
+                    if autoPairOnPrecomm {
+                        autoPairOnPrecomm = false
+                        transition(.needsPairing, CWL("正在下发配对请求…"))
+                        beginPairing(forceNew: true)
+                    } else {
+                        wantsSession = false
+                        transition(.needsPairing, CWL("点击「建立本机配对」，然后按一下车上的 P 键确认。"))
+                    }
                 }
             case (.pairing, 0x5c):
                 if frame.index == 1, let key = currentKey, let selection = attemptVehicle {
@@ -465,8 +514,11 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
                     candidateKeys.removeAll()
                     logBLE("0x5D 认证成功！purpose=\(purpose == .pairing ? "pairing" : "projection")")
                     if purpose == .pairing {
+                        let alreadySelected = garage.selected?.id == selection.id
                         updateGarage { $0.save(selection) }
-                        finishDisconnect(message: CWL("配对完成。请在「已配对车辆」中选择这台车。"))
+                        finishDisconnect(message: alreadySelected
+                            ? CWL("配对完成。现在可以直接启动投屏。")
+                            : CWL("配对完成。请在「已配对车辆」中选择这台车。"))
                     } else if purpose == .projection && wantsSession {
                         requestNavigation()
                     }
@@ -744,6 +796,8 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
         wantsSession = false
         purpose = nil
         attemptVehicle = nil
+        autoPairOnPrecomm = false
+        rePairScanTargetID = nil
     }
 
     private func scheduleReconnect() {
@@ -801,6 +855,7 @@ extension NinebotVehicleConnection: @preconcurrency CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         guard central.state == .poweredOn else {
             isScanning = false
+            pendingRePair = nil
             reconnectTask?.cancel()
             resetAttempt()
             peripheral = nil
@@ -810,6 +865,7 @@ extension NinebotVehicleConnection: @preconcurrency CBCentralManagerDelegate {
         }
         if scanRequested { startScan() }
         else if wantsSession, peripheral == nil { reconnectVehicle() }
+        else if pendingRePair != nil { startPendingRePair() }
         else if pendingProjection != nil { startPendingProjection() }
         else if phase == .unavailable { transition(.idle, CWL("蓝牙已就绪。")) }
     }
@@ -817,6 +873,16 @@ extension NinebotVehicleConnection: @preconcurrency CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDiscover item: CBPeripheral,
                         advertisementData: [String: Any], rssi _: NSNumber) {
         guard isScanning else { return }
+        if let targetID = rePairScanTargetID, item.identifier == targetID {
+            rePairScanTargetID = nil
+            deadlineTask?.cancel()
+            central.stopScan()
+            isScanning = false
+            peripherals[item.identifier] = item
+            logBLE("定向扫描已找到车辆，立即连接")
+            connectPeripheral(item)
+            return
+        }
         var evidence = scanDetails[item.identifier] ?? DiscoveryEvidence()
         let identified = evidence.merge(
             manufacturerData: advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,

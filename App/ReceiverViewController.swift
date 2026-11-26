@@ -195,6 +195,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     private let ninebot43AddressField = UITextField()
     private let ninebotVehicle = NinebotVehicleConnection()
     private let ninebotVehicleButton = UIButton(type: .system)
+    private let ninebotQuickRePairButton = UIButton(type: .system)
     private let ninebotVehicleStatus = UILabel()
     private var ninebotVehicleObservation: AnyCancellable?
     private var requestedVehicleProjection = false
@@ -206,6 +207,18 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     private func updateNinebotStatus(_ message: String) {
         ninebotStatus.text = message
         ninebotCardStatus.text = message
+    }
+    private func refreshNinebotQuickRePairButton() {
+        let hasSelected = ninebotVehicle.garage.selected != nil
+        ninebotQuickRePairButton.isHidden = !hasSelected
+        guard hasSelected else { return }
+        if ninebotVehicle.isPairing {
+            ninebotQuickRePairButton.configuration?.title = CWL("取消配对")
+            ninebotQuickRePairButton.isEnabled = !running && !waitingForNetwork
+        } else {
+            ninebotQuickRePairButton.configuration?.title = CWL("一键重新配对（按 P 键）")
+            ninebotQuickRePairButton.isEnabled = !running && !waitingForNetwork && ninebotVehicle.canQuickRePair
+        }
     }
     private let tailingCard = UIStackView()
     private let tailingCardStatus = UILabel()
@@ -571,11 +584,23 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         ninebotVehicleButton.configuration?.title = CWL("车辆配对")
         ninebotVehicleButton.addAction(UIAction { [weak self] _ in self?.revealSettings(vehicle: true) }, for: .touchUpInside)
         ninebotCard.addArrangedSubview(ninebotVehicleButton)
-        ninebotVehicleObservation = ninebotVehicle.$status.combineLatest(ninebotVehicle.$garage).sink { [weak self] status, garage in
-            self?.ninebotVehicleButton.configuration?.subtitle = garage.selected?.name
-            self?.ninebotVehicleStatus.isHidden = garage.selected == nil
-            self?.ninebotVehicleStatus.text = status
-        }
+        ninebotQuickRePairButton.configuration = .tinted()
+        ninebotQuickRePairButton.configuration?.title = CWL("一键重新配对（按 P 键）")
+        ninebotQuickRePairButton.addAction(UIAction { [weak self] _ in
+            guard let self, !self.running, !self.waitingForNetwork else { return }
+            if self.ninebotVehicle.isPairing { self.ninebotVehicle.cancelPairing() }
+            else { self.ninebotVehicle.rePairSelectedVehicle() }
+        }, for: .touchUpInside)
+        ninebotCard.addArrangedSubview(ninebotQuickRePairButton)
+        ninebotVehicleObservation = ninebotVehicle.$status
+            .combineLatest(ninebotVehicle.$garage, ninebotVehicle.$phase, ninebotVehicle.$isScanning)
+            .sink { [weak self] status, garage, _, _ in
+                guard let self else { return }
+                self.ninebotVehicleButton.configuration?.subtitle = garage.selected?.name
+                self.ninebotVehicleStatus.isHidden = garage.selected == nil && !self.ninebotVehicle.isPairing
+                self.ninebotVehicleStatus.text = status
+                self.refreshNinebotQuickRePairButton()
+            }
         stack.addArrangedSubview(ninebotCard)
         configureConnectionCard(tailingCard, title: CWL("台铃 4.3 寸连接"), symbol: "scooter", color: .systemOrange,
             instructions: CWL("iPhone 加入仪表的 Wi-Fi，打开仪表投屏，再启动本机 CarPlay。画面在仪表上显示，操作在 iPhone 上完成。"),
@@ -1894,6 +1919,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         cfmotoAddressField.isEnabled = value
         ninebotAddressField.isEnabled = value
         ninebot43AddressField.isEnabled = value
+        refreshNinebotQuickRePairButton()
         tailingAddressField.isEnabled = value
         carLifeAddressField.isEnabled = value
     }

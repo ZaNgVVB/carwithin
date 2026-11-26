@@ -31,10 +31,19 @@ struct NinebotVehiclePairingView: View {
                         }
                     }
                 }
+                if !locked, connection.canQuickRePair {
+                    Button(CWL("一键重新配对（按 P 键）")) {
+                        connection.rePairSelectedVehicle()
+                    }
+                }
             } header: {
                 Text(CWL("已配对车辆"))
             } footer: {
-                if locked { Text(CWL("停止投屏后可添加或更换车辆。")) }
+                if locked {
+                    Text(CWL("停止投屏后可添加或更换车辆。"))
+                } else if connection.garage.selected != nil {
+                    Text(CWL("切回九号出行连过蓝牙导致认证失败时，直接点「一键重新配对（按 P 键）」即可，无需删除重扫。"))
+                }
             }
             .disabled(locked || !connection.canChooseVehicle)
 

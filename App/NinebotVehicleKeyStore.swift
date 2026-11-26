@@ -52,10 +52,11 @@ struct NinebotVehicleKeyStore {
         return record
     }
 
-    /// Reuse a pending key on an explicitly requested retry instead of overwriting it.
-    func prepareCandidate(for id: UUID) throws -> Data {
+    /// Reuse a pending key on an explicitly requested retry instead of overwriting it,
+    /// unless a fresh re-pair explicitly requests a new candidate.
+    func prepareCandidate(for id: UUID, forceNew: Bool = false) throws -> Data {
         var record = try load(for: id)
-        if let pending = record.pendingKey { return pending }
+        if !forceNew, let pending = record.pendingKey { return pending }
         var bytes = [UInt8](repeating: 0, count: 32)
         let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
         guard status == errSecSuccess else { throw Failure.system(status) }
