@@ -384,7 +384,10 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
     }
 
     private func handle(_ frame: VehicleBLEFrame) {
-        logBLE("RX src=0x\(String(format: "%02X", Int(frame.src))) dst=0x\(String(format: "%02X", Int(frame.dst))) cmd=0x\(String(format: "%02X", Int(frame.command))) idx=0x\(String(format: "%02X", Int(frame.index))) len=\(frame.payload.count) phase=\(phase.rawValue)")
+        let dataDetail = frame.command == 0x71 && !frame.payload.isEmpty
+            ? " data=" + frame.payload.map { String(format: "%02X", Int($0)) }.joined()
+            : ""
+        logBLE("RX src=0x\(String(format: "%02X", Int(frame.src))) dst=0x\(String(format: "%02X", Int(frame.dst))) cmd=0x\(String(format: "%02X", Int(frame.command))) idx=0x\(String(format: "%02X", Int(frame.index))) len=\(frame.payload.count)\(dataDetail) phase=\(phase.rawValue)")
         guard frame.dst == 0x3e, !disconnecting else { return }
         if frame.src == 0x23, frame.command == 0x71 {
             if frame.index == 0xff, frame.payload == Data([0]), authenticated, purpose == .projection {
@@ -398,6 +401,7 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
                 if phase == .starting, authenticated, wantsSession {
                     retryTask?.cancel()
                     reconnectCount = 0
+                    logBLE("仪表已确认导航开启（0x71 ACK）")
                     transition(.active, CWL("仪表已确认导航开启。"))
                 }
                 // STOP has the same empty ACK as START. An older START ACK can
