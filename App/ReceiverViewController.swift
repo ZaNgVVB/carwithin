@@ -2321,6 +2321,7 @@ extension ReceiverViewController {
             connection: ninebotVehicle, locked: running || waitingForNetwork
         ))
         controller.title = CWL("车辆配对")
+        controller.navigationItem.largeTitleDisplayMode = .never
         return controller
     }
     private func ninebotVehicleLogPage() -> UIViewController {
@@ -2328,6 +2329,7 @@ extension ReceiverViewController {
             connection: ninebotVehicle
         ))
         controller.title = CWL("九号蓝牙日志")
+        controller.navigationItem.largeTitleDisplayMode = .never
         return controller
     }
 

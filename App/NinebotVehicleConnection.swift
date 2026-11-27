@@ -45,6 +45,7 @@ final class NinebotVehicleConnection: NSObject, ObservableObject {
     var canScan: Bool { purpose == nil && pendingProjection == nil && pendingRePair == nil && peripheral == nil }
     var canChooseVehicle: Bool { canScan && !scanRequested }
     var isPairing: Bool { purpose == .pairing || scanRequested || pendingRePair != nil }
+    var activeVehicleName: String? { attemptVehicle?.name ?? pendingRePair?.name }
 
     private enum Purpose { case pairing, projection }
 
