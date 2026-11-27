@@ -6,7 +6,6 @@ struct NinebotVehiclePairingView: View {
     let locked: Bool
     @State private var vehicleToForget: NinebotVehicle?
     @State private var confirmsRemoval = false
-    @State private var copiedLogs = false
 
     var body: some View {
         Form {
@@ -90,22 +89,6 @@ struct NinebotVehiclePairingView: View {
                     Text(CWL("通电后扫描并选择自己的车辆。发起配对后请等待约 5–8 秒，待提示「车机已就绪」并震动后再短按车上的 P 键。"))
                 }
             }
-
-            if !connection.debugLogs.isEmpty {
-                Section {
-                    Button(copiedLogs ? CWL("已复制蓝牙日志") : CWL("复制蓝牙日志")) {
-                        UIPasteboard.general.string = connection.debugLogs.joined(separator: "\n")
-                        copiedLogs = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copiedLogs = false }
-                    }
-                    Text(connection.debugLogs.suffix(12).joined(separator: "\n"))
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                } header: {
-                    Text(CWL("蓝牙诊断日志"))
-                }
-            }
         }
         .onDisappear { if !locked { connection.cancelPairing() } }
         .confirmationDialog(CWL("删除本机配对记录？"), isPresented: $confirmsRemoval, titleVisibility: .visible,
@@ -124,5 +107,44 @@ struct NinebotVehiclePairingView: View {
             .contentShape(Rectangle())
         }
         .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+struct NinebotVehicleDiagnosticsLogView: View {
+    @ObservedObject var connection: NinebotVehicleConnection
+    @State private var copiedLogs = false
+
+    var body: some View {
+        Form {
+            Section {
+                if connection.debugLogs.isEmpty {
+                    Text(CWL("暂无九号蓝牙日志。"))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(connection.debugLogs.joined(separator: "\n"))
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+            } header: {
+                Text(CWL("九号蓝牙诊断日志"))
+            } footer: {
+                Text(CWL("最近 80 条，不含蓝牙配对密钥或敏感载荷。同时也会写入「诊断与实验 › 日志」。"))
+            }
+
+            if !connection.debugLogs.isEmpty {
+                Section {
+                    Button(copiedLogs ? CWL("已复制蓝牙日志") : CWL("复制蓝牙日志")) {
+                        UIPasteboard.general.string = connection.debugLogs.joined(separator: "\n")
+                        copiedLogs = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copiedLogs = false }
+                    }
+                    Button(CWL("清空蓝牙日志"), role: .destructive) {
+                        connection.clearDebugLogs()
+                    }
+                }
+            }
+        }
     }
 }

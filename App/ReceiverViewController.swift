@@ -2323,6 +2323,13 @@ extension ReceiverViewController {
         controller.title = CWL("车辆配对")
         return controller
     }
+    private func ninebotVehicleLogPage() -> UIViewController {
+        let controller = UIHostingController(rootView: NinebotVehicleDiagnosticsLogView(
+            connection: ninebotVehicle
+        ))
+        controller.title = CWL("九号蓝牙日志")
+        return controller
+    }
 
     private func alert(_ title: String, _ message: String) {
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
@@ -3259,12 +3266,20 @@ extension ReceiverViewController {
         let model = withUnsafeBytes(of: &system.machine) {
             String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self)
         }
-        return SettingsSection(CWL("诊断信息"), [
-            .page(CWL("日志"), icon: ("doc.text.fill", .systemGray)) { [unowned self] in self.logPage() },
+        var rows: [SettingsRow] = [
+            .page(CWL("日志"), icon: ("doc.text.fill", .systemGray)) { [unowned self] in self.logPage() }
+        ]
+        if supportsNinebotVehicle || !ninebotVehicle.debugLogs.isEmpty {
+            rows.append(.page(CWL("九号蓝牙日志"), icon: ("antenna.radiowaves.left.and.right", .systemBlue), detail: { [unowned self] in
+                self.ninebotVehicle.debugLogs.isEmpty ? nil : "\(self.ninebotVehicle.debugLogs.count)"
+            }) { [unowned self] in self.ninebotVehicleLogPage() })
+        }
+        rows += [
             .info(CWL("浏览器页面"), BrowserReceiverPage.version),
             .info(CWL("设备"), "\(model) · iOS \(UIDevice.current.systemVersion)"),
             .info(CWL("MFi 身份"), identity != nil ? CWL("已载入") : CWL("未载入"))
-        ])
+        ]
+        return SettingsSection(CWL("诊断信息"), rows)
     }
 
     private func diagnosticsPage() -> SettingsPageController {
