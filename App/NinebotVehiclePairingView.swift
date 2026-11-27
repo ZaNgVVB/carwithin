@@ -32,10 +32,12 @@ struct NinebotVehiclePairingView: View {
     }
 
     private var statusAccent: UIColor {
-        if connection.readyForButtonPress || connection.phase == .active {
+        if connection.readyForButtonPress {
             return .systemGreen
         }
         switch connection.phase {
+        case .active:
+            return .systemGreen
         case .needsPairing, .reconnecting, .unavailable:
             return .systemOrange
         case .failed:
@@ -70,6 +72,8 @@ struct NinebotVehiclePairingView: View {
             return CWL("正在搜索附近的九号车辆")
         case .connecting, .discovering, .preparing:
             return CWL("正在与车辆建立蓝牙握手")
+        case .needsPairing:
+            return CWL("蓝牙已连接 · 等待建立配对")
         case .pairing:
             return CWL("等待车机就绪（约 5–8 秒）· 先别按 P 键")
         case .authenticating:
